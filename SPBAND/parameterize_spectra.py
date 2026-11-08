@@ -69,7 +69,7 @@ class NoModelError(SpecParamError):
 
 class ParamSpectra():
     # implement FOOOF but allow for predefined bandwindows
-    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1):
+    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1, mu_bounds=None, amp_lo=None):
         """Model a power spectrum as a combination of aperiodic and periodic components.
 
         WARNING: frequency and power values inputs must be in linear space.
@@ -103,6 +103,14 @@ class ParamSpectra():
             Whether to iterate the peak fitting process.
         verbose : bool, optional, default: True
             Verbosity mode. If True, prints out warnings and general status updates.
+        mu_bounds : dict or None, optional, default: None
+            Per-band override of the allowed Gaussian center range, {(band_lo, band_hi): (lo_hz, hi_hz)}.
+            Keys are bands exactly as listed in `bands`. None keeps each center inside its own band.
+        amp_lo : dict or None, optional, default: None
+            Per-band lower bound on Gaussian amplitude, {(band_lo, band_hi): value}. None keeps the
+            published unbounded amplitude. Use 0.0 to forbid negative peaks in a band.
+            Validated alpha setting: bands=ALPHA_SPLIT_BANDS, mu_bounds=ALPHA_SPLIT_MU_BOUNDS,
+            amp_lo=ALPHA_SPLIT_AMP_LO (two alpha Gaussians, centers free in 7-13 Hz, non-negative).
 
 
         Attributes
@@ -167,6 +175,8 @@ class ParamSpectra():
         self.prominence = prominence
         self.max_n_peaks = max_n_peaks
         self.iterate_peaks = iterate_peaks
+        self.mu_bounds = mu_bounds
+        self.amp_lo = amp_lo
 
         
         self.bands, self.bandname = str2band(bands, max_n_peaks=self.max_n_peaks, l_freq=l_freq, h_freq=h_freq, n_division=n_division)
@@ -601,7 +611,8 @@ class ParamSpectra():
             self._spectrum_flat = self.power_spectrum - self._ap_fit
 
             # Find peaks, and fit them with gaussians
-            self.gaussian_params_ = constrained_gaussian_fit(self.freqs, self._spectrum_flat, self.bands, log_freqs=self.log_freqs)
+            self.gaussian_params_ = constrained_gaussian_fit(self.freqs, self._spectrum_flat, self.bands, log_freqs=self.log_freqs,
+                                                             mu_bounds=self.mu_bounds, amp_lo=self.amp_lo)
 
             # Calculate the peak fit (shape is same as power_spectrum)
             #   Note: if no peaks are found, this creates a flat (all zero) peak fit
@@ -1107,7 +1118,7 @@ def sum_of_gaussians_jac(x, bands, *params):
     J[:, 2::3] = g * (z * z - 1) / s
     return J
     
-def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
+def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_bounds=None, amp_lo=None):
     """
     Fits len(bands) number of gaussians to the power spectrum, with the constraint that the gaussians sum to the power spectrum.
     and that the means of the gaussians are within the bands and that the std_devs are the width of the bands.
@@ -1116,10 +1127,17 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
         power_spectrum (np.array): The power spectrum in log10 space
         bands (list of tuples): The bands to fit the gaussians to, e.g. [(0, 4), (5, 10)]
         log_freqs (bool): Whether to log (base e) the frequencies before fitting the gaussians
+        mu_bounds (dict or None): {(band_lo, band_hi): (lo_hz, hi_hz)} allowed center range per band, in Hz.
+            Bands not listed keep their own edges. None reproduces the published fit.
+        amp_lo (dict or None): {(band_lo, band_hi): value} amplitude lower bound per band.
+            Bands not listed keep -inf. None reproduces the published fit.
     Returns:
         popt (np.array): The parameters of the gaussians of shape (3*len(bands),) where the parameters are (amplitude, mean, std_dev) for each gaussian
     """
     num_gaussians = len(bands)
+    bands_hz = [tuple(b) for b in bands]
+    mu_bounds = mu_bounds or {}
+    amp_lo = amp_lo or {}
     if log_freqs:
         freqs = np.log(freqs)
         bands = [(np.log(l), np.log(h)) for l, h in bands]
@@ -1127,11 +1145,16 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
     my_func = lambda x, *params: sum_of_gaussians(x, bands, *params)
     initial_guess = []
     bounds = []
-    for l_bound, h_bound in bands:
+    for band_hz, (l_bound, h_bound) in zip(bands_hz, bands):
         band_vals = power_spectrum[np.logical_and(freqs > l_bound, freqs <= h_bound)]
         freqs_in_band = freqs[np.logical_and(freqs > l_bound, freqs <= h_bound)]
-        initial_guess.extend([np.max(band_vals), np.mean(freqs_in_band), compute_gauss_std((h_bound-l_bound)/2)])
-        bounds.extend([(-np.inf, np.inf), (l_bound, h_bound), (0, compute_gauss_std((h_bound-l_bound)))])
+        a_lo = amp_lo.get(band_hz, -np.inf)
+        mu_lo, mu_hi = l_bound, h_bound
+        if band_hz in mu_bounds:
+            mu_lo, mu_hi = (np.log(mu_bounds[band_hz][0]), np.log(mu_bounds[band_hz][1])) if log_freqs else mu_bounds[band_hz]
+        # the amplitude guess is raised to the floor only when a floor is set (max(x, -inf) == x)
+        initial_guess.extend([max(np.max(band_vals), a_lo + 1e-6), np.mean(freqs_in_band), compute_gauss_std((h_bound-l_bound)/2)])
+        bounds.extend([(a_lo, np.inf), (mu_lo, mu_hi), (0, compute_gauss_std((h_bound-l_bound)))])
         # # Initialize parameters with random values (you can customize this)
         # initial_guess.extend([np.max(power_spectrum), np.mean(freqs), 1.0])
     
@@ -1149,6 +1172,39 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
 
 # # Example usage:
 # # Replace the following with your actual data and bands
+
+# Validated alpha setting (E8): theta 4-7 Hz, two alpha Gaussians whose centers may each sit anywhere
+# in 7-13 Hz, alpha amplitudes non-negative. All other bands as in 'standard'.
+ALPHA_SPLIT_BANDS = [(0.3, 1.5), (1.5, 4), (4, 7), (7, 10), (10, 13), (13, 30), (30, 70), (70, 150), (150, 250)]
+ALPHA_SPLIT_MU_BOUNDS = {(7, 10): (7, 13), (10, 13): (7, 13)}
+ALPHA_SPLIT_AMP_LO = {(7, 10): 0.0, (10, 13): 0.0}
+
+
+def find_band_peaks(model, f_range=(7, 13), min_height=0.1, merge_gap_hz=0.75):
+    """
+    Peaks of a fitted ParamSpectra with centers in f_range, as a list of (center_hz, height_log10).
+
+    Every band gets a Gaussian whether or not a peak exists, so a height threshold is required:
+    toy validation gives ~0.25 (log10) for 60 s Welch windows and ~0.1 for long, smooth spectra.
+    Neighbors closer than merge_gap_hz are merged (height-weighted center, max height); 0.75 Hz
+    was the validated gap. Height is the Gaussian peak height, A / (sigma * sqrt(2 pi)).
+    """
+    g = np.asarray(model.gaussian_params_).reshape(-1, 3)
+    peaks = []
+    for amp, mu, sd in g:
+        cf = np.exp(mu) if model.log_freqs else mu
+        height = amp / (sd * np.sqrt(2 * np.pi))
+        if f_range[0] <= cf <= f_range[1] and height > min_height:
+            peaks.append((float(cf), float(height)))
+    merged = []
+    for cf, height in sorted(peaks):
+        if merged and cf - merged[-1][0] <= merge_gap_hz:
+            c0, h0 = merged[-1]
+            merged[-1] = ((c0 * h0 + cf * height) / (h0 + height), max(h0, height))
+        else:
+            merged.append((cf, height))
+    return merged
+
 
 def _test_periodic_fit():
     freqs = np.linspace(0, 10, 100)
