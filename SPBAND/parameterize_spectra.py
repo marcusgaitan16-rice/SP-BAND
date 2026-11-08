@@ -1070,9 +1070,12 @@ def gen_gaussian(x, amplitude, mean, std_dev):
     return amplitude * stats.norm.pdf(x, loc=mean, scale=std_dev)
 
 # https://stackoverflow.com/questions/16082171/curve-fitting-by-a-sum-of-gaussian-with-scipy
+SQRT2PI = np.sqrt(2 * np.pi)
+
 def sum_of_gaussians(x, bands, *params):
     """
-    Generate a sum of gaussians
+    Generate a sum of gaussians (vectorised over bands; same formula as gen_gaussian,
+    amplitude * stats.norm.pdf, without the scipy.stats overhead)
     Inputs:
         X - The x values (frequencies)
         bands - The bands to fit the gaussians to, e.g. [(0, 4), (5, 10)]
@@ -1080,11 +1083,29 @@ def sum_of_gaussians(x, bands, *params):
     Outputs:
         result - The sum of the gaussians
     """
-    result = np.zeros_like(x)
-    params = np.reshape(params, (len(bands), 3))  # Reshape the flat parameter array, will fail if not 3*len(bands) parameters
-    for idx in range(len(bands)):
-        result += gen_gaussian(x, *params[idx])
-    return result
+    p = np.reshape(params, (len(bands), 3))
+    a, mu, s = p[:, 0], p[:, 1], p[:, 2]
+    z = (x[:, None] - mu) / s
+    return (a / (s * SQRT2PI) * np.exp(-0.5 * z * z)).sum(axis=1)
+
+
+def sum_of_gaussians_jac(x, bands, *params):
+    """
+    Analytic Jacobian of sum_of_gaussians: shape (len(x), 3*len(bands)), columns (A, mu, sigma) per band.
+        dg/dA = exp(-z**2/2) / (sigma*sqrt(2*pi)),  dg/dmu = g*z/sigma,  dg/dsigma = g*(z**2 - 1)/sigma
+    with z = (x - mu)/sigma and g = A * N(x; mu, sigma). Replaces curve_fit's finite differences
+    (24 extra model evaluations per iteration).
+    """
+    p = np.reshape(params, (len(bands), 3))
+    a, mu, s = p[:, 0], p[:, 1], p[:, 2]
+    z = (x[:, None] - mu) / s
+    base = np.exp(-0.5 * z * z) / (s * SQRT2PI)
+    g = a * base
+    J = np.empty((x.size, p.size))
+    J[:, 0::3] = base
+    J[:, 1::3] = g * z / s
+    J[:, 2::3] = g * (z * z - 1) / s
+    return J
     
 def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
     """
@@ -1118,7 +1139,8 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False):
     # param_names = ['amplitude', 'mean', 'std_dev']
     # print(f"Bounds: {[f'{n}_{i//3}:({l},{h})' for i, (n, l, h) in enumerate(zip(param_names*num_gaussians, bounds[0], bounds[1]))]}")
     # Perform curve fittin
-    popt, _ = curve_fit(my_func, freqs, power_spectrum, p0=initial_guess, maxfev=10000, bounds = bounds) # params get reshaped into len(bands),3
+    popt, _ = curve_fit(my_func, freqs, power_spectrum, p0=initial_guess, maxfev=10000, bounds = bounds,
+                        jac=lambda x, *p: sum_of_gaussians_jac(x, bands, *p)) # params get reshaped into len(bands),3
     
     # if log_freqs:
     #     popt = np.array(popt)
