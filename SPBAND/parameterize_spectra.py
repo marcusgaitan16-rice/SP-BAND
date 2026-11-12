@@ -69,7 +69,7 @@ class NoModelError(SpecParamError):
 
 class ParamSpectra():
     # implement FOOOF but allow for predefined bandwindows
-    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1, mu_bounds=None, amp_lo=None):
+    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1, mu_bounds=None, amp_lo=None, lowpass=None):
         """Model a power spectrum as a combination of aperiodic and periodic components.
 
         WARNING: frequency and power values inputs must be in linear space.
@@ -87,7 +87,7 @@ class ParamSpectra():
             Whether or not the periodic components are fit in natural log space. Input frequency should be in linear space.
         n_division : int, optional, default: 1
             Number of divisions to split each frequency band into.
-        aperiodic_mode : {'fixed', 'knee'}
+        aperiodic_mode : {'fixed', 'knee', 'knee_lp_floor'}
             Which approach to take for fitting the aperiodic component.
        
         l_freq : float, optional, default: 0.3
@@ -103,6 +103,9 @@ class ParamSpectra():
             Whether to iterate the peak fitting process.
         verbose : bool, optional, default: True
             Verbosity mode. If True, prints out warnings and general status updates.
+        lowpass : (float, float) or None, optional, default: None
+            Only for aperiodic_mode='knee_lp_floor'. (cutoff_hz, order) of the recording low-pass filter.
+            None fits both per spectrum; a tuple fixes them (use the hardware spec when known).
         mu_bounds : dict or None, optional, default: None
             Per-band override of the allowed Gaussian center range, {(band_lo, band_hi): (lo_hz, hi_hz)}.
             Keys are bands exactly as listed in `bands`. None keeps each center inside its own band.
@@ -177,6 +180,7 @@ class ParamSpectra():
         self.iterate_peaks = iterate_peaks
         self.mu_bounds = mu_bounds
         self.amp_lo = amp_lo
+        self._lp_fixed = tuple(lowpass) if lowpass is not None else None
 
         
         self.bands, self.bandname = str2band(bands, max_n_peaks=self.max_n_peaks, l_freq=l_freq, h_freq=h_freq, n_division=n_division)
@@ -273,7 +277,7 @@ class ParamSpectra():
         if clear_results:
 
             self.aperiodic_params_ = np.array([np.nan] * \
-                (2 if self.aperiodic_mode == 'fixed' else 3))
+                {'fixed': 2, 'knee': 3, 'knee_lp_floor': 6}.get(self.aperiodic_mode, 3))
             self.gaussian_params_ = np.empty([0, 3]) # amplitude, mean, std
             self.peak_params_ = np.empty([0, 3]) # CF, PW, BW
             self.r_squared_ = np.nan
@@ -479,8 +483,7 @@ class ParamSpectra():
         spectrum_ignore = power_spectrum[perc_mask]
 
         # Get bounds for aperiodic fitting, dropping knee bound if not set to fit knee
-        ap_bounds = self._ap_bounds if self.aperiodic_mode == 'knee' \
-            else tuple(bound[0::2] for bound in self._ap_bounds)
+        ap_bounds = self._ap_bounds_for(freqs)
 
         # Second aperiodic fit - using results of first fit as guess parameters
         #  See note in _simple_ap_fit about warnings
@@ -505,18 +508,30 @@ class ParamSpectra():
             print(f"Fit aperiodic component with {self.aperiodic_mode} mode, params shape: {aperiodic_params.shape}")
         return aperiodic_params
 
+    def _ap_bounds_for(self, freqs):
+        """Aperiodic bounds for the current mode."""
+        if self.aperiodic_mode == 'knee':
+            return self._ap_bounds
+        if self.aperiodic_mode == 'knee_lp_floor':
+            lo, hi = self._ap_bounds
+            fixed = self._lp_fixed
+            if fixed:                                      # roll-off known: pin it (curve_fit needs lo < hi)
+                fc, n = fixed
+                return (tuple(lo) + (fc, n, -np.inf), tuple(hi) + (fc * (1 + 1e-9), n * (1 + 1e-9), np.inf))
+            return (tuple(lo) + (freqs.min(), 0.5, -np.inf), tuple(hi) + (10 * freqs.max(), 8.0, np.inf))
+        return tuple(bound[0::2] for bound in self._ap_bounds)
+
     def _simple_ap_fit(self, freqs, power_spectrum):
         # Get the guess parameters and/or calculate from the data, as needed
         #   Note that these are collected as lists, to concatenate with or without knee later
         off_guess = [power_spectrum[1] if not self._ap_guess[0] else self._ap_guess[0]]
-        kne_guess = [self._ap_guess[1]] if self.aperiodic_mode == 'knee' else []
+        kne_guess = [self._ap_guess[1]] if self.aperiodic_mode in ('knee', 'knee_lp_floor') else []
         exp_guess = [np.abs((self.power_spectrum[-1] - self.power_spectrum[0]) /
                             (np.log10(self.freqs[-1]) - np.log10(self.freqs[0])))
                      if not self._ap_guess[2] else self._ap_guess[2]]
 
         # Get bounds for aperiodic fitting, dropping knee bound if not set to fit knee
-        ap_bounds = self._ap_bounds if self.aperiodic_mode == 'knee' \
-            else tuple(bound[0::2] for bound in self._ap_bounds)
+        ap_bounds = self._ap_bounds_for(freqs)
 
         if self.verbose>4:
             print(f"Is ap_guess none? {self._ap_guess[0] is None}, {self._ap_guess[1] is None}, {self._ap_guess[2] is None}")
@@ -524,6 +539,10 @@ class ParamSpectra():
             print(f"power_spectrum shape {power_spectrum.shape} , off guess: {off_guess}, kne guess: {kne_guess}, exp guess: {exp_guess}")
         # Collect together guess parameters
         guess = np.array(off_guess + kne_guess + exp_guess)
+        if self.aperiodic_mode == 'knee_lp_floor':
+            # roll-off starts in the upper part of the range; floor starts 1 decade under the lowest power
+            fc, n = self._lp_fixed or (0.6 * freqs.max(), 2.0)
+            guess = np.concatenate([guess, [fc * (1 + 5e-10), n * (1 + 5e-10), power_spectrum.min() - 1.0]])
         if self.verbose>4:
             print(f"Guess: {guess}")
 
@@ -902,6 +921,8 @@ def get_ap_func(aperiodic_mode):
         ap_func = expo_nk_function
     elif aperiodic_mode == 'knee':
         ap_func = expo_function
+    elif aperiodic_mode == 'knee_lp_floor':
+        ap_func = expo_lp_floor_function
     else:
         raise ValueError("Requested aperiodic mode not understood.")
 
@@ -934,6 +955,18 @@ def expo_function(xs, *params):
     ys = offset - np.log10(inner_arg)
 
     return ys
+
+def expo_lp_floor_function(xs, *params):
+    """Knee aperiodic component with a low-pass roll-off and a white noise floor (linear freqs in, log10 out).
+
+    y = log10( 10^offset / (knee + x^exp) / (1 + (x / lp_hz)^(2 * lp_order)) + 10^floor )
+    """
+    offset, knee, exp, lp_hz, lp_order, floor = params
+    inner_arg = knee + xs**exp
+    inner_arg[inner_arg <= 0] = np.min(inner_arg[inner_arg > 0])
+    neural = offset - np.log10(inner_arg) - np.log10(1 + (xs / lp_hz) ** (2 * lp_order))
+    return np.logaddexp(neural * np.log(10), floor * np.log(10)) / np.log(10)
+
 
 def expo_nk_function(xs, *params):
     """Exponential fitting function, for fitting aperiodic component without a 'knee'.
@@ -1010,6 +1043,8 @@ def infer_ap_func(aperiodic_params):
         aperiodic_mode = 'fixed'
     elif len(aperiodic_params) == 3:
         aperiodic_mode = 'knee'
+    elif len(aperiodic_params) == 6:
+        aperiodic_mode = 'knee_lp_floor'
     else:
         raise InconsistentDataError("The given aperiodic parameters are "
                                     "inconsistent with available options.")
