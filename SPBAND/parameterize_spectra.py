@@ -69,7 +69,7 @@ class NoModelError(SpecParamError):
 
 class ParamSpectra():
     # implement FOOOF but allow for predefined bandwindows
-    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1, mu_bounds=None, amp_lo=None):
+    def __init__(self, bands='standard',  max_n_peaks=6, log_freqs=True, n_division=1, l_freq=0.3, h_freq=250, prominence=0.5, linenoise=60, aperiodic_mode='knee', iterate_peaks=False, verbose=1, mu_bounds=None, amp_lo=None, freq_spacing='linear', n_bins=300, df_max=1.0):
         """Model a power spectrum as a combination of aperiodic and periodic components.
 
         WARNING: frequency and power values inputs must be in linear space.
@@ -106,6 +106,17 @@ class ParamSpectra():
         mu_bounds : dict or None, optional, default: None
             Per-band override of the allowed Gaussian center range, {(band_lo, band_hi): (lo_hz, hi_hz)}.
             Keys are bands exactly as listed in `bands`. None keeps each center inside its own band.
+        freq_spacing : 'linear', 'log' or 'loglin', optional, default: 'linear'
+            Opt-in rebinning before the fit ('linear' keeps the published behaviour). 'log' averages linear power
+            in n_bins log-spaced bins over the fitted range; 'loglin' is log-spaced until the bin width reaches
+            df_max Hz, then linear. Line noise is interpolated on the native (even) grid first, so the spectrum
+            stays continuous across 50/60 Hz. Bins narrower than the native resolution are empty and dropped.
+            Rebinned fits are much faster but weight frequencies differently: with the one-knee aperiodic model
+            the exponent changes (the knee moves from the roll-off to low frequencies). self.freqs,
+            self.power_spectrum and r_squared_ refer to the rebinned grid; bin_counts_ holds native points per bin.
+            Averaging lowers the per-bin noise, so peak height thresholds should be lowered: see find_band_peaks.
+        n_bins : int, default: 300 (log / loglin)
+        df_max : float, default: 1.0 (Hz, loglin only)
         amp_lo : dict or None, optional, default: None
             Per-band lower bound on Gaussian amplitude, {(band_lo, band_hi): value}. None keeps the
             published unbounded amplitude. Use 0.0 to forbid negative peaks in a band.
@@ -176,6 +187,9 @@ class ParamSpectra():
         self.max_n_peaks = max_n_peaks
         self.iterate_peaks = iterate_peaks
         self.mu_bounds = mu_bounds
+        if freq_spacing not in ('linear', 'log', 'loglin'):
+            raise ValueError("freq_spacing must be 'linear', 'log' or 'loglin'")
+        self.freq_spacing, self.n_bins, self.df_max = freq_spacing, n_bins, df_max
         self.amp_lo = amp_lo
 
         
@@ -398,6 +412,9 @@ class ParamSpectra():
         # Calculate frequency resolution, and actual frequency range of the data
         freq_range = [freqs.min(), freqs.max()]
         freq_res = freqs[1] - freqs[0]
+        if self._check_freqs and not np.all(np.isclose(np.diff(freqs), freq_res)):
+            raise DataError("The input frequency values are not evenly spaced. "
+                            "The model expects equidistant frequency values in linear space.")
 
 
         if self.verbose>2:
@@ -419,17 +436,20 @@ class ParamSpectra():
             self._noise_pks = noise_pks
             self._noise_ranges = noise_ranges
 
+        # Optional rebinning (opt-in), after line noise was interpolated on the native grid
+        if self.freq_spacing != 'linear':
+            freqs, power_spectrum, self.bin_counts_ = rebin_spectrum(freqs, power_spectrum, self.freq_spacing, self.n_bins, self.df_max)
+        else:
+            self.bin_counts_ = np.ones(len(freqs), dtype=int)
+        # half a nominal log bin (natural-log units) when rebinned; 0 on the native grid
+        self._sd_lo = 0.5 * np.log(freqs.max() / freqs.min()) / self.n_bins if self.freq_spacing != 'linear' and self.log_freqs else 0.0
+
         # Log power values
         power_spectrum = np.log10(power_spectrum)
 
         ## Data checks - run checks on inputs based on check modes
 
-        if self._check_freqs:
-            # Check if the frequency data is unevenly spaced, and raise an error if so
-            freq_diffs = np.diff(freqs)
-            if not np.all(np.isclose(freq_diffs, freq_res)):
-                raise DataError("The input frequency values are not evenly spaced. "
-                                "The model expects equidistant frequency values in linear space.")
+        # (even spacing is checked on the input above, before any rebinning)
         if self._check_data:
             # Check if there are any infs / nans, and raise an error if so
             if np.any(np.isinf(power_spectrum)) or np.any(np.isnan(power_spectrum)):
@@ -612,7 +632,7 @@ class ParamSpectra():
 
             # Find peaks, and fit them with gaussians
             self.gaussian_params_ = constrained_gaussian_fit(self.freqs, self._spectrum_flat, self.bands, log_freqs=self.log_freqs,
-                                                             mu_bounds=self.mu_bounds, amp_lo=self.amp_lo)
+                                                             mu_bounds=self.mu_bounds, amp_lo=self.amp_lo, sd_lo=self._sd_lo)
 
             # Calculate the peak fit (shape is same as power_spectrum)
             #   Note: if no peaks are found, this creates a flat (all zero) peak fit
@@ -1118,7 +1138,7 @@ def sum_of_gaussians_jac(x, bands, *params):
     J[:, 2::3] = g * (z * z - 1) / s
     return J
     
-def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_bounds=None, amp_lo=None):
+def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_bounds=None, amp_lo=None, sd_lo=0.0):
     """
     Fits len(bands) number of gaussians to the power spectrum, with the constraint that the gaussians sum to the power spectrum.
     and that the means of the gaussians are within the bands and that the std_devs are the width of the bands.
@@ -1129,6 +1149,8 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_b
         log_freqs (bool): Whether to log (base e) the frequencies before fitting the gaussians
         mu_bounds (dict or None): {(band_lo, band_hi): (lo_hz, hi_hz)} allowed center range per band, in Hz.
             Bands not listed keep their own edges. None reproduces the published fit.
+        sd_lo (float): lower bound on every Gaussian's std (0 reproduces the published fit; set to half a bin
+            on rebinned grids so peaks cannot be narrower than the data resolve).
         amp_lo (dict or None): {(band_lo, band_hi): value} amplitude lower bound per band.
             Bands not listed keep -inf. None reproduces the published fit.
     Returns:
@@ -1154,7 +1176,8 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_b
             mu_lo, mu_hi = (np.log(mu_bounds[band_hz][0]), np.log(mu_bounds[band_hz][1])) if log_freqs else mu_bounds[band_hz]
         # the amplitude guess is raised to the floor only when a floor is set (max(x, -inf) == x)
         initial_guess.extend([max(np.max(band_vals), a_lo + 1e-6), np.mean(freqs_in_band), compute_gauss_std((h_bound-l_bound)/2)])
-        bounds.extend([(a_lo, np.inf), (mu_lo, mu_hi), (0, compute_gauss_std((h_bound-l_bound)))])
+        sd_hi = compute_gauss_std((h_bound-l_bound))
+        bounds.extend([(a_lo, np.inf), (mu_lo, mu_hi), (min(sd_lo, 0.5 * sd_hi), sd_hi)])
         # # Initialize parameters with random values (you can customize this)
         # initial_guess.extend([np.max(power_spectrum), np.mean(freqs), 1.0])
     
@@ -1175,12 +1198,40 @@ def constrained_gaussian_fit(freqs, power_spectrum, bands, log_freqs=False, mu_b
 
 # Validated alpha setting (E8): theta 4-7 Hz, two alpha Gaussians whose centers may each sit anywhere
 # in 7-13 Hz, alpha amplitudes non-negative. All other bands as in 'standard'.
+def grid_edges(f_lo, f_hi, kind="log", n_bins=300, df_max=1.0):
+    """Bin edges for rebin_spectrum. 'log': n_bins log-spaced bins. 'loglin': the same log edges until the
+    bin width reaches df_max Hz, then linear steps of df_max up to f_hi."""
+    edges = np.geomspace(f_lo, f_hi, n_bins + 1)
+    if kind == "loglin":
+        wide = np.flatnonzero(np.diff(edges) > df_max)
+        if wide.size:
+            f_c = edges[wide[0]]
+            edges = np.concatenate([edges[:wide[0] + 1], np.arange(f_c + df_max, f_hi, df_max), [f_hi]])
+    elif kind != "log":
+        raise ValueError("kind must be 'log' or 'loglin'")
+    return edges
+
+
+def rebin_spectrum(freqs, power_spectrum, kind="log", n_bins=300, df_max=1.0):
+    """Average LINEAR power inside each bin of grid_edges(...). Each bin's frequency is the mean of its native
+    frequencies; bins with no native points (finer than the native resolution) are dropped.
+    Returns bin frequencies, mean power, and the number of native points in each bin."""
+    edges = grid_edges(freqs.min(), freqs.max() * (1 + 1e-12), kind, n_bins, df_max)
+    nb = len(edges) - 1
+    idx = np.clip(np.digitize(freqs, edges) - 1, 0, nb - 1)
+    cnt = np.bincount(idx, minlength=nb)
+    keep = cnt > 0
+    f = np.bincount(idx, weights=freqs, minlength=nb)[keep] / cnt[keep]
+    p = np.bincount(idx, weights=power_spectrum, minlength=nb)[keep] / cnt[keep]
+    return f, p, cnt[keep]
+
+
 ALPHA_SPLIT_BANDS = [(0.3, 1.5), (1.5, 4), (4, 7), (7, 10), (10, 13), (13, 30), (30, 70), (70, 150), (150, 250)]
 ALPHA_SPLIT_MU_BOUNDS = {(7, 10): (7, 13), (10, 13): (7, 13)}
 ALPHA_SPLIT_AMP_LO = {(7, 10): 0.0, (10, 13): 0.0}
 
 
-def find_band_peaks(model, f_range=(7, 13), min_height=0.1, merge_gap_hz=0.75):
+def find_band_peaks(model, f_range=(7, 13), min_height=None, merge_gap_hz=0.75, noise_averages=None, z=2.2):
     """
     Peaks of a fitted ParamSpectra with centers in f_range, as a list of (center_hz, height_log10).
 
@@ -1188,7 +1239,25 @@ def find_band_peaks(model, f_range=(7, 13), min_height=0.1, merge_gap_hz=0.75):
     toy validation gives ~0.25 (log10) for 60 s Welch windows and ~0.1 for long, smooth spectra.
     Neighbors closer than merge_gap_hz are merged (height-weighted center, max height); 0.75 Hz
     was the validated gap. Height is the Gaussian peak height, A / (sigma * sqrt(2 pi)).
+
+    min_height defaults to 0.1. Alternatively pass noise_averages (K, the number of Welch segments averaged)
+    and the threshold is z * 0.43 / sqrt(K * M), where 0.43/sqrt(K) is the per-bin log10 noise SD and M is the
+    mean number of native points per fitted bin inside f_range (model.bin_counts_; M = 1 on the native grid).
+    z = 2.2 reproduces the validated native-grid thresholds (0.25 at K = 14, 0.1 at K = 100).
+    On a log grid M > 1, so the threshold drops (300 bins, 60 s windows: M ~ 4, threshold ~ 0.13).
+    Caveats: this assumes independent bins. Neighbouring Welch bins are correlated by the taper, so on real data
+    the noise drops by less than sqrt(M) and this threshold is a lower bound; in toys it ran slightly loose
+    (~10% false alpha at 300 bins, K = 14), where a fixed 0.15 was clean. Calibrate on real data (split-half).
     """
+    if noise_averages is not None:
+        if min_height is not None:
+            raise ValueError("pass min_height or noise_averages, not both")
+        counts = getattr(model, "bin_counts_", None)
+        in_range = (model.freqs >= f_range[0]) & (model.freqs <= f_range[1])
+        m_eff = float(np.mean(counts[in_range])) if counts is not None and in_range.any() else 1.0
+        min_height = z * 0.43 / np.sqrt(noise_averages * m_eff)
+    elif min_height is None:
+        min_height = 0.1
     g = np.asarray(model.gaussian_params_).reshape(-1, 3)
     peaks = []
     for amp, mu, sd in g:
